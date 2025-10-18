@@ -82,6 +82,8 @@ A web-based management center for CLIProxyAPI.
 
 Set `remote-management.disable-control-panel` to `true` if you prefer to host the management UI elsewhere; the server will skip downloading `management.html` and `/management.html` will return 404.
 
+You can set the `MANAGEMENT_STATIC_PATH` environment variable to choose the directory where `management.html` is stored.
+
 ### Authentication
 
 You can authenticate for Gemini, OpenAI, Claude, Qwen, and/or iFlow. All can coexist in the same `auth-dir` and will be load balanced.
@@ -429,14 +431,54 @@ To enable this feature, set the `GITSTORE_GIT_URL` environment variable to the U
 | `GITSTORE_GIT_USERNAME` | No       |                           | The username for Git authentication.                                                                    |
 | `GITSTORE_GIT_TOKEN`    | No       |                           | The personal access token (or password) for Git authentication.                                         |
 
-
-
 **How it Works**
 
 1.  **Cloning:** On startup, the application clones the remote Git repository to the `GITSTORE_LOCAL_PATH`.
 2.  **Configuration:** It then looks for a `config.yaml` inside a `config` directory within the cloned repository.
 3.  **Bootstrapping:** If `config/config.yaml` does not exist in the repository, the application will copy the local `config.example.yaml` to that location, commit, and push it to the remote repository as an initial configuration. You must have `config.example.yaml` available.
 4.  **Token Sync:** The `auth-dir` is also managed within this repository. Any changes to authentication tokens (e.g., through a new login) are automatically committed and pushed to the remote Git repository.
+
+### PostgreSQL-backed Configuration and Token Store
+
+You can also persist configuration and authentication data in PostgreSQL when running CLIProxyAPI in hosted environments that favor managed databases over local files.
+
+**Environment Variables**
+
+| Variable              | Required | Default               | Description                                                                                                   |
+|-----------------------|----------|-----------------------|---------------------------------------------------------------------------------------------------------------|
+| `MANAGEMENT_PASSWORD` | Yes      |                       | Password for the management web UI (required when remote management is enabled).                              |
+| `PGSTORE_DSN`         | Yes      |                       | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/db`).                                     |
+| `PGSTORE_SCHEMA`      | No       | public                | Schema where the tables will be created. Leave empty to use the default schema.                                |
+| `PGSTORE_LOCAL_PATH`  | No       | Current working directory  | Root directory for the local mirror; the server writes to `<value>/pgstore`. If unset and CWD is unavailable, `/tmp/pgstore` is used. |
+
+**How it Works**
+
+1.  **Initialization:** On startup the server connects via `PGSTORE_DSN`, ensures the schema exists, and creates the `config_store` / `auth_store` tables when missing.
+2.  **Local Mirror:** A writable cache at `<PGSTORE_LOCAL_PATH or CWD>/pgstore` mirrors `config/config.yaml` and `auths/` so the rest of the application can reuse the existing file-based logic.
+3.  **Bootstrapping:** If no configuration row exists, `config.example.yaml` seeds the database using the fixed identifier `config`.
+4.  **Token Sync:** Changes flow both ways—file updates are written to PostgreSQL and database records are mirrored back to disk so watchers and management APIs continue to operate.
+
+### Object Storage-backed Configuration and Token Store
+
+An S3-compatible object storage service can host configuration and authentication records.
+
+**Environment Variables**
+
+| Variable                 | Required | Default                        | Description                                                                                                              |
+|--------------------------|----------|--------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `MANAGEMENT_PASSWORD`    | Yes      |                                | Password for the management web UI (required when remote management is enabled).                                        |
+| `OBJECTSTORE_ENDPOINT`   | Yes      |                                | Object storage endpoint. Include `http://` or `https://` to force the protocol (omitted scheme → HTTPS).                |
+| `OBJECTSTORE_BUCKET`     | Yes      |                                | Bucket that stores `config/config.yaml` and `auths/*.json`.                                                             |
+| `OBJECTSTORE_ACCESS_KEY` | Yes      |                                | Access key ID for the object storage account.                                                                           |
+| `OBJECTSTORE_SECRET_KEY` | Yes      |                                | Secret key for the object storage account.                                                                              |
+| `OBJECTSTORE_LOCAL_PATH` | No       | Current working directory      | Root directory for the local mirror; the server writes to `<value>/objectstore`. If unset, defaults to current CWD.     |
+
+**How it Works**
+
+1. **Startup:** The endpoint is parsed (respecting any scheme prefix), a MinIO-compatible client is created in path-style mode, and the bucket is created when missing.
+2. **Local Mirror:** A writable cache at `<OBJECTSTORE_LOCAL_PATH or CWD>/objectstore` mirrors `config/config.yaml` and `auths/`.
+3. **Bootstrapping:** When `config/config.yaml` is absent in the bucket, the server copies `config.example.yaml`, uploads it, and uses it as the initial configuration.
+4. **Sync:** Changes to configuration or auth files are uploaded to the bucket, and remote updates are mirrored back to disk, keeping watchers and management APIs in sync.
 
 ### OpenAI Compatibility Providers
 
@@ -489,21 +531,6 @@ And you can always use Gemini CLI with `CODE_ASSIST_ENDPOINT` set to `http://127
 ### Authentication Directory
 
 The `auth-dir` parameter specifies where authentication tokens are stored. When you run the login command, the application will create JSON files in this directory containing the authentication tokens for your Google accounts. Multiple accounts can be used for load balancing.
-
-### Request Authentication Providers
-
-Configure inbound authentication through the `auth.providers` section. The built-in `config-api-key` provider works with inline keys:
-
-```
-auth:
-  providers:
-    - name: default
-      type: config-api-key
-      api-keys:
-        - your-api-key-1
-```
-
-Clients should send requests with an `Authorization: Bearer your-api-key-1` header (or `X-Goog-Api-Key`, `X-Api-Key`, or `?key=` as before). The legacy top-level `api-keys` array is still accepted and automatically synced to the default provider for backwards compatibility.
 
 ### Official Generative Language API
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -207,8 +208,53 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sync request authentication providers with inline API keys for backwards compatibility.
 	syncInlineAccessProvider(&cfg)
 
+	// Sanitize OpenAI compatibility providers: drop entries without base-url
+	sanitizeOpenAICompatibility(&cfg)
+
+	// Sanitize Codex keys: drop entries without base-url
+	sanitizeCodexKeys(&cfg)
+
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// sanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
+// not actionable, specifically those missing a BaseURL. It trims whitespace before
+// evaluation and preserves the relative order of remaining entries.
+func sanitizeOpenAICompatibility(cfg *Config) {
+	if cfg == nil || len(cfg.OpenAICompatibility) == 0 {
+		return
+	}
+	out := make([]OpenAICompatibility, 0, len(cfg.OpenAICompatibility))
+	for i := range cfg.OpenAICompatibility {
+		e := cfg.OpenAICompatibility[i]
+		e.Name = strings.TrimSpace(e.Name)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		if e.BaseURL == "" {
+			// Skip providers with no base-url; treated as removed
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.OpenAICompatibility = out
+}
+
+// sanitizeCodexKeys removes Codex API key entries missing a BaseURL.
+// It trims whitespace and preserves order for remaining entries.
+func sanitizeCodexKeys(cfg *Config) {
+	if cfg == nil || len(cfg.CodexKey) == 0 {
+		return
+	}
+	out := make([]CodexKey, 0, len(cfg.CodexKey))
+	for i := range cfg.CodexKey {
+		e := cfg.CodexKey[i]
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		if e.BaseURL == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.CodexKey = out
 }
 
 func syncInlineAccessProvider(cfg *Config) {
@@ -280,6 +326,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
+	normalizeCollectionNodeStyles(original.Content[0])
 
 	// Write back.
 	f, err := os.Create(configFile)
@@ -518,5 +565,32 @@ func removeMapKey(mapNode *yaml.Node, key string) {
 			mapNode.Content = append(mapNode.Content[:i], mapNode.Content[i+2:]...)
 			return
 		}
+	}
+}
+
+// normalizeCollectionNodeStyles forces YAML collections to use block notation, keeping
+// lists and maps readable. Empty sequences retain flow style ([]) so empty list markers
+// remain compact.
+func normalizeCollectionNodeStyles(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+	switch node.Kind {
+	case yaml.MappingNode:
+		node.Style = 0
+		for i := range node.Content {
+			normalizeCollectionNodeStyles(node.Content[i])
+		}
+	case yaml.SequenceNode:
+		if len(node.Content) == 0 {
+			node.Style = yaml.FlowStyle
+		} else {
+			node.Style = 0
+		}
+		for i := range node.Content {
+			normalizeCollectionNodeStyles(node.Content[i])
+		}
+	default:
+		// Scalars keep their existing style to preserve quoting
 	}
 }

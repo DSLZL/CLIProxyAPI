@@ -96,6 +96,8 @@ CLIProxyAPI 的基于 Web 的管理中心。
 
 如果希望自行托管管理页面，可在配置中将 `remote-management.disable-control-panel` 设为 `true`，服务器将停止下载 `management.html`，并让 `/management.html` 返回 404。
 
+可以通过设置环境变量 `MANAGEMENT_STATIC_PATH` 来指定 `management.html` 的存储目录。
+
 ### 身份验证
 
 您可以分别为 Gemini、OpenAI、Claude、Qwen 和 iFlow 进行身份验证，它们可同时存在于同一个 `auth-dir` 中并参与负载均衡。
@@ -436,7 +438,7 @@ openai-compatibility:
 
 | 变量                      | 必需 | 默认值    | 描述                                                 |
 |-------------------------|----|--------|----------------------------------------------------|
-| `MANAGEMENT_PASSWORD`   | 是  |        | 控制面板密码                                             |
+| `MANAGEMENT_PASSWORD`   | 是  |        | 管理面板密码                                             |
 | `GITSTORE_GIT_URL`      | 是  |        | 要使用的 Git 仓库的 HTTPS URL。                            |
 | `GITSTORE_LOCAL_PATH`   | 否  | 当前工作目录 | 将克隆 Git 仓库的本地路径。在 Docker 内部，此路径默认为 `/CLIProxyAPI`。 |
 | `GITSTORE_GIT_USERNAME` | 否  |        | 用于 Git 身份验证的用户名。                                   |
@@ -448,6 +450,48 @@ openai-compatibility:
 2.  **配置：** 然后，它会在克隆的仓库内的 `config` 目录中查找 `config.yaml` 文件。
 3.  **引导：** 如果仓库中不存在 `config/config.yaml`，应用程序会将本地的 `config.example.yaml` 复制到该位置，然后提交并推送到远程仓库作为初始配置。您必须确保 `config.example.yaml` 文件可用。
 4.  **令牌同步：** `auth-dir` 也在此仓库中管理。对身份验证令牌的任何更改（例如，通过新的登录）都会自动提交并推送到远程 Git 仓库。
+
+### PostgreSQL 支持的配置与令牌存储
+
+在托管环境中运行服务时，可以选择使用 PostgreSQL 来保存配置与令牌，借助托管数据库减轻本地文件管理压力。
+
+**环境变量**
+
+| 变量                      | 必需 | 默认值          | 描述                                                                 |
+|-------------------------|----|---------------|----------------------------------------------------------------------|
+| `MANAGEMENT_PASSWORD`   | 是  |               | 管理面板密码（启用远程管理时必需）。                                          |
+| `PGSTORE_DSN`           | 是  |               | PostgreSQL 连接串，例如 `postgresql://user:pass@host:5432/db`。       |
+| `PGSTORE_SCHEMA`        | 否  | public        | 创建表时使用的 schema；留空则使用默认 schema。                               |
+| `PGSTORE_LOCAL_PATH`    | 否  | 当前工作目录       | 本地镜像根目录，服务将在 `<值>/pgstore` 下写入缓存；若无法获取工作目录则退回 `/tmp/pgstore`。 |
+
+**工作原理**
+
+1.  **初始化：** 启动时通过 `PGSTORE_DSN` 连接数据库，确保 schema 存在，并在缺失时创建 `config_store` 与 `auth_store`。
+2.  **本地镜像：** 在 `<PGSTORE_LOCAL_PATH 或当前工作目录>/pgstore` 下建立可写缓存，复用 `config/config.yaml` 与 `auths/` 目录。
+3.  **引导：** 若数据库中无配置记录，会使用 `config.example.yaml` 初始化，并以固定标识 `config` 写入。
+4.  **令牌同步：** 配置与令牌的更改会写入 PostgreSQL，同时数据库中的内容也会反向同步至本地镜像，便于文件监听与管理接口继续工作。
+
+### 对象存储驱动的配置与令牌存储
+
+可以选择使用 S3 兼容的对象存储来托管配置与鉴权数据。
+
+**环境变量**
+
+| 变量                     | 是否必填 | 默认值             | 说明                                                                                                                     |
+|--------------------------|----------|--------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `MANAGEMENT_PASSWORD`    | 是       |                    | 管理面板密码（启用远程管理时必需）。                                                                             |
+| `OBJECTSTORE_ENDPOINT`   | 是       |                    | 对象存储访问端点。可带 `http://` 或 `https://` 前缀指定协议（省略则默认 HTTPS）。                                      |
+| `OBJECTSTORE_BUCKET`     | 是       |                    | 用于存放 `config/config.yaml` 与 `auths/*.json` 的 Bucket 名称。                                                        |
+| `OBJECTSTORE_ACCESS_KEY` | 是       |                    | 对象存储账号的访问密钥 ID。                                                                                              |
+| `OBJECTSTORE_SECRET_KEY` | 是       |                    | 对象存储账号的访问密钥 Secret。                                                                                          |
+| `OBJECTSTORE_LOCAL_PATH` | 否       | 当前工作目录 (CWD) | 本地镜像根目录；服务会写入到 `<值>/objectstore`。                                                                         |
+
+**工作流程**
+
+1. **启动阶段：** 解析端点地址（识别协议前缀），创建 MinIO 兼容客户端并使用 Path-Style 模式，如 Bucket 不存在会自动创建。
+2. **本地镜像：** 在 `<OBJECTSTORE_LOCAL_PATH 或当前工作目录>/objectstore` 维护可写缓存，同步 `config/config.yaml` 与 `auths/`。
+3. **初始化：** 若 Bucket 中缺少配置文件，将以 `config.example.yaml` 为模板生成 `config/config.yaml` 并上传。
+4. **双向同步：** 本地变更会上传到对象存储，同时远端对象也会拉回到本地，保证文件监听、管理 API 与 CLI 命令行为一致。
 
 ### OpenAI 兼容上游提供商
 
@@ -495,21 +539,6 @@ openai-compatibility:
 ### 身份验证目录
 
 `auth-dir` 参数指定身份验证令牌的存储位置。当您运行登录命令时，应用程序将在此目录中创建包含 Google 账户身份验证令牌的 JSON 文件。多个账户可用于轮询。
-
-### 请求鉴权提供方
-
-通过 `auth.providers` 配置接入请求鉴权。内置的 `config-api-key` 提供方支持内联密钥：
-
-```
-auth:
-  providers:
-    - name: default
-      type: config-api-key
-      api-keys:
-        - your-api-key-1
-```
-
-调用时可在 `Authorization` 标头中携带密钥（或继续使用 `X-Goog-Api-Key`、`X-Api-Key`、查询参数 `key`）。为了兼容旧版本，顶层的 `api-keys` 字段仍然可用，并会自动同步到默认的 `config-api-key` 提供方。
 
 ### 官方生成式语言 API
 
