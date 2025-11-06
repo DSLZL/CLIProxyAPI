@@ -45,6 +45,23 @@ type ModelInfo struct {
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
 	// SupportedParameters lists supported parameters
 	SupportedParameters []string `json:"supported_parameters,omitempty"`
+
+	// Thinking holds provider-specific reasoning/thinking budget capabilities.
+	// This is optional and currently used for Gemini thinking budget normalization.
+	Thinking *ThinkingSupport `json:"thinking,omitempty"`
+}
+
+// ThinkingSupport describes a model family's supported internal reasoning budget range.
+// Values are interpreted in provider-native token units.
+type ThinkingSupport struct {
+	// Min is the minimum allowed thinking budget (inclusive).
+	Min int `json:"min,omitempty"`
+	// Max is the maximum allowed thinking budget (inclusive).
+	Max int `json:"max,omitempty"`
+	// ZeroAllowed indicates whether 0 is a valid value (to disable thinking).
+	ZeroAllowed bool `json:"zero_allowed,omitempty"`
+	// DynamicAllowed indicates whether -1 is a valid value (dynamic thinking budget).
+	DynamicAllowed bool `json:"dynamic_allowed,omitempty"`
 }
 
 // ModelRegistration tracks a model's availability
@@ -352,14 +369,14 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	if model == nil {
 		return nil
 	}
-	copy := *model
+	copyModel := *model
 	if len(model.SupportedGenerationMethods) > 0 {
-		copy.SupportedGenerationMethods = append([]string(nil), model.SupportedGenerationMethods...)
+		copyModel.SupportedGenerationMethods = append([]string(nil), model.SupportedGenerationMethods...)
 	}
 	if len(model.SupportedParameters) > 0 {
-		copy.SupportedParameters = append([]string(nil), model.SupportedParameters...)
+		copyModel.SupportedParameters = append([]string(nil), model.SupportedParameters...)
 	}
-	return &copy
+	return &copyModel
 }
 
 // UnregisterClient removes a client and decrements counts for its models
@@ -506,6 +523,31 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
 }
 
+// ClientSupportsModel reports whether the client registered support for modelID.
+func (r *ModelRegistry) ClientSupportsModel(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	models, exists := r.clientModels[clientID]
+	if !exists || len(models) == 0 {
+		return false
+	}
+
+	for _, id := range models {
+		if strings.EqualFold(strings.TrimSpace(id), modelID) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // GetAvailableModels returns all models that have at least one available client
 // Parameters:
 //   - handlerType: The handler type to filter models for (e.g., "openai", "claude", "gemini")
@@ -532,17 +574,25 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 			}
 		}
 
-		suspendedClients := 0
+		cooldownSuspended := 0
+		otherSuspended := 0
 		if registration.SuspendedClients != nil {
-			suspendedClients = len(registration.SuspendedClients)
+			for _, reason := range registration.SuspendedClients {
+				if strings.EqualFold(reason, "quota") {
+					cooldownSuspended++
+					continue
+				}
+				otherSuspended++
+			}
 		}
-		effectiveClients := availableClients - expiredClients - suspendedClients
+
+		effectiveClients := availableClients - expiredClients - otherSuspended
 		if effectiveClients < 0 {
 			effectiveClients = 0
 		}
 
-		// Only include models that have available clients
-		if effectiveClients > 0 {
+		// Include models that have available clients, or those solely cooling down.
+		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
 			model := r.convertModelToMap(registration.Info, handlerType)
 			if model != nil {
 				models = append(models, model)
@@ -642,6 +692,17 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 		result = append(result, item.name)
 	}
 	return result
+}
+
+// GetModelInfo returns the registered ModelInfo for the given model ID, if present.
+// Returns nil if the model is unknown to the registry.
+func (r *ModelRegistry) GetModelInfo(modelID string) *ModelInfo {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	if reg, ok := r.models[modelID]; ok && reg != nil {
+		return reg.Info
+	}
+	return nil
 }
 
 // convertModelToMap converts ModelInfo to the appropriate format for different handler types

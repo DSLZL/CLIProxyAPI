@@ -43,12 +43,22 @@ quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
   switch-preview-model: true # Whether to automatically switch to a preview model when a quota is exceeded
 
-# API keys for official Generative Language API
+# When true, enable authentication for the WebSocket API (/v1/ws).
+ws-auth: false
+
+# Gemini API keys (preferred)
+#gemini-api-key:
+#  - api-key: "AIzaSy...01"
+#    # base-url: "https://generativelanguage.googleapis.com"
+#    # headers:
+#    #   X-Custom-Header: "custom-value"
+#    # proxy-url: "socks5://proxy.example.com:1080"
+#  - api-key: "AIzaSy...02"
+
+# API keys for official Generative Language API (legacy compatibility)
 #generative-language-api-key:
 #  - "AIzaSy...01"
 #  - "AIzaSy...02"
-#  - "AIzaSy...03"
-#  - "AIzaSy...04"
 
 # Codex API keys
 #codex-api-key:
@@ -62,6 +72,9 @@ quota-exceeded:
 #  - api-key: "sk-atSM..."
 #    base-url: "https://www.example.com" # use the custom claude API endpoint
 #    proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#    models:
+#      - name: "claude-3-5-sonnet-20241022" # upstream model name
+#        alias: "claude-sonnet-latest" # client alias mapped to the upstream model
 
 # OpenAI compatibility providers
 #openai-compatibility:

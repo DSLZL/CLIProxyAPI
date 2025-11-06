@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	client "github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -97,7 +99,7 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 							if len(toolCallIDs) > 1 {
 								funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-1], "-")
 							}
-							responseData := contentResult.Get("content").String()
+							responseData := contentResult.Get("content").Raw
 							functionResponse := client.FunctionResponse{Name: funcName, Response: map[string]interface{}{"result": responseData}}
 							clientContent.Parts = append(clientContent.Parts, client.Part{FunctionResponse: &functionResponse})
 						}
@@ -125,6 +127,7 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 				inputSchema := inputSchemaResult.Raw
 				tool, _ := sjson.Delete(toolResult.Raw, "input_schema")
 				tool, _ = sjson.SetRaw(tool, "parametersJsonSchema", inputSchema)
+				tool, _ = sjson.Delete(tool, "strict")
 				var toolDeclaration any
 				if err := json.Unmarshal([]byte(tool), &toolDeclaration); err == nil {
 					tools[0].FunctionDeclarations = append(tools[0].FunctionDeclarations, toolDeclaration)
@@ -136,7 +139,7 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 	}
 
 	// Build output Gemini CLI request JSON
-	out := `{"model":"","request":{"contents":[],"generationConfig":{"thinkingConfig":{"include_thoughts":true}}}}`
+	out := `{"model":"","request":{"contents":[]}}`
 	out, _ = sjson.Set(out, "model", modelName)
 	if systemInstruction != nil {
 		b, _ := json.Marshal(systemInstruction)
@@ -151,21 +154,16 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 		out, _ = sjson.SetRaw(out, "request.tools", string(b))
 	}
 
-	// Map reasoning and sampling configs
-	reasoningEffortResult := gjson.GetBytes(rawJSON, "reasoning_effort")
-	if reasoningEffortResult.String() == "none" {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.include_thoughts", false)
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", 0)
-	} else if reasoningEffortResult.String() == "auto" {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-	} else if reasoningEffortResult.String() == "low" {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", 1024)
-	} else if reasoningEffortResult.String() == "medium" {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", 8192)
-	} else if reasoningEffortResult.String() == "high" {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", 24576)
-	} else {
-		out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
+	// Map Anthropic thinking -> Gemini thinkingBudget/include_thoughts when type==enabled
+	if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() && util.ModelSupportsThinking(modelName) {
+		if t.Get("type").String() == "enabled" {
+			if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
+				budget := int(b.Int())
+				budget = util.NormalizeThinkingBudget(modelName, budget)
+				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
+				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
+			}
+		}
 	}
 	if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() && v.Type == gjson.Number {
 		out, _ = sjson.Set(out, "request.generationConfig.temperature", v.Num)
@@ -177,5 +175,8 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 		out, _ = sjson.Set(out, "request.generationConfig.topK", v.Num)
 	}
 
-	return []byte(out)
+	outBytes := []byte(out)
+	outBytes = common.AttachDefaultSafetySettings(outBytes, "request.safetySettings")
+
+	return outBytes
 }

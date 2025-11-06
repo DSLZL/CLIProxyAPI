@@ -20,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"github.com/tiktoken-go/tokenizer"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -39,13 +40,14 @@ func (e *CodexExecutor) Identifier() string { return "codex" }
 
 func (e *CodexExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
 
-func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	apiKey, baseURL := codexCreds(auth)
 
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -79,9 +81,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
-		return cliproxyexecutor.Response{}, err
+		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey)
 	var authID, authLabel, authType, authValue string
@@ -101,25 +103,29 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	resp, err := httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return resp, err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
+	}()
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", resp.StatusCode, string(b))
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		return resp, err
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
@@ -140,18 +146,21 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, line, &param)
-		return cliproxyexecutor.Response{Payload: []byte(out)}, nil
+		resp = cliproxyexecutor.Response{Payload: []byte(out)}
+		return resp, nil
 	}
-	return cliproxyexecutor.Response{}, statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	return resp, err
 }
 
-func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
 	apiKey, baseURL := codexCreds(auth)
 
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -184,7 +193,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return nil, err
 	}
@@ -208,28 +217,36 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	resp, err := httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
-	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer func() { _ = resp.Body.Close() }()
-		b, readErr := io.ReadAll(resp.Body)
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		data, readErr := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
 		if readErr != nil {
 			recordAPIResponseError(ctx, e.cfg, readErr)
 			return nil, readErr
 		}
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", resp.StatusCode, string(b))
-		return nil, statusErr{code: resp.StatusCode, msg: string(b)}
+		appendAPIResponseChunk(ctx, e.cfg, data)
+		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	stream = out
 	go func() {
 		defer close(out)
-		defer func() { _ = resp.Body.Close() }()
-		scanner := bufio.NewScanner(resp.Body)
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+		}()
+		scanner := bufio.NewScanner(httpResp.Body)
 		buf := make([]byte, 20_971_520)
 		scanner.Buffer(buf, 20_971_520)
 		var param any
@@ -251,16 +268,190 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
 		}
-		if err = scanner.Err(); err != nil {
-			recordAPIResponseError(ctx, e.cfg, err)
-			out <- cliproxyexecutor.StreamChunk{Err: err}
+		if errScan := scanner.Err(); errScan != nil {
+			recordAPIResponseError(ctx, e.cfg, errScan)
+			reporter.publishFailure(ctx)
+			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
 	}()
-	return out, nil
+	return stream, nil
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{Payload: []byte{}}, fmt.Errorf("not implemented")
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("codex")
+	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+
+	modelForCounting := req.Model
+
+	if util.InArray([]string{"gpt-5", "gpt-5-minimal", "gpt-5-low", "gpt-5-medium", "gpt-5-high"}, req.Model) {
+		modelForCounting = "gpt-5"
+		body, _ = sjson.SetBytes(body, "model", "gpt-5")
+		switch req.Model {
+		case "gpt-5-minimal":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "minimal")
+		case "gpt-5-low":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "low")
+		case "gpt-5-medium":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "medium")
+		case "gpt-5-high":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "high")
+		default:
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "low")
+		}
+	} else if util.InArray([]string{"gpt-5-codex", "gpt-5-codex-low", "gpt-5-codex-medium", "gpt-5-codex-high"}, req.Model) {
+		modelForCounting = "gpt-5"
+		body, _ = sjson.SetBytes(body, "model", "gpt-5-codex")
+		switch req.Model {
+		case "gpt-5-codex-low":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "low")
+		case "gpt-5-codex-medium":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "medium")
+		case "gpt-5-codex-high":
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "high")
+		default:
+			body, _ = sjson.SetBytes(body, "reasoning.effort", "low")
+		}
+	}
+
+	body, _ = sjson.DeleteBytes(body, "previous_response_id")
+	body, _ = sjson.SetBytes(body, "stream", false)
+
+	enc, err := tokenizerForCodexModel(modelForCounting)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
+	}
+
+	count, err := countCodexInputTokens(enc, body)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: token counting failed: %w", err)
+	}
+
+	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
+	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
+	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
+}
+
+func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
+	sanitized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case sanitized == "":
+		return tokenizer.Get(tokenizer.Cl100kBase)
+	case strings.HasPrefix(sanitized, "gpt-5"):
+		return tokenizer.ForModel(tokenizer.GPT5)
+	case strings.HasPrefix(sanitized, "gpt-4.1"):
+		return tokenizer.ForModel(tokenizer.GPT41)
+	case strings.HasPrefix(sanitized, "gpt-4o"):
+		return tokenizer.ForModel(tokenizer.GPT4o)
+	case strings.HasPrefix(sanitized, "gpt-4"):
+		return tokenizer.ForModel(tokenizer.GPT4)
+	case strings.HasPrefix(sanitized, "gpt-3.5"), strings.HasPrefix(sanitized, "gpt-3"):
+		return tokenizer.ForModel(tokenizer.GPT35Turbo)
+	default:
+		return tokenizer.Get(tokenizer.Cl100kBase)
+	}
+}
+
+func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
+	if enc == nil {
+		return 0, fmt.Errorf("encoder is nil")
+	}
+	if len(body) == 0 {
+		return 0, nil
+	}
+
+	root := gjson.ParseBytes(body)
+	var segments []string
+
+	if inst := strings.TrimSpace(root.Get("instructions").String()); inst != "" {
+		segments = append(segments, inst)
+	}
+
+	inputItems := root.Get("input")
+	if inputItems.IsArray() {
+		arr := inputItems.Array()
+		for i := range arr {
+			item := arr[i]
+			switch item.Get("type").String() {
+			case "message":
+				content := item.Get("content")
+				if content.IsArray() {
+					parts := content.Array()
+					for j := range parts {
+						part := parts[j]
+						if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+							segments = append(segments, text)
+						}
+					}
+				}
+			case "function_call":
+				if name := strings.TrimSpace(item.Get("name").String()); name != "" {
+					segments = append(segments, name)
+				}
+				if args := strings.TrimSpace(item.Get("arguments").String()); args != "" {
+					segments = append(segments, args)
+				}
+			case "function_call_output":
+				if out := strings.TrimSpace(item.Get("output").String()); out != "" {
+					segments = append(segments, out)
+				}
+			default:
+				if text := strings.TrimSpace(item.Get("text").String()); text != "" {
+					segments = append(segments, text)
+				}
+			}
+		}
+	}
+
+	tools := root.Get("tools")
+	if tools.IsArray() {
+		tarr := tools.Array()
+		for i := range tarr {
+			tool := tarr[i]
+			if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
+				segments = append(segments, name)
+			}
+			if desc := strings.TrimSpace(tool.Get("description").String()); desc != "" {
+				segments = append(segments, desc)
+			}
+			if params := tool.Get("parameters"); params.Exists() {
+				val := params.Raw
+				if params.Type == gjson.String {
+					val = params.String()
+				}
+				if trimmed := strings.TrimSpace(val); trimmed != "" {
+					segments = append(segments, trimmed)
+				}
+			}
+		}
+	}
+
+	textFormat := root.Get("text.format")
+	if textFormat.Exists() {
+		if name := strings.TrimSpace(textFormat.Get("name").String()); name != "" {
+			segments = append(segments, name)
+		}
+		if schema := textFormat.Get("schema"); schema.Exists() {
+			val := schema.Raw
+			if schema.Type == gjson.String {
+				val = schema.String()
+			}
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				segments = append(segments, trimmed)
+			}
+		}
+	}
+
+	text := strings.Join(segments, "\n")
+	if text == "" {
+		return 0, nil
+	}
+
+	count, err := enc.Count(text)
+	if err != nil {
+		return 0, err
+	}
+	return int64(count), nil
 }
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -302,6 +493,33 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
+	var cache codexCache
+	if from == "claude" {
+		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
+		if userIDResult.Exists() {
+			var hasKey bool
+			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
+			if cache, hasKey = codexCacheMap[key]; !hasKey || cache.Expire.Before(time.Now()) {
+				cache = codexCache{
+					ID:     uuid.New().String(),
+					Expire: time.Now().Add(1 * time.Hour),
+				}
+				codexCacheMap[key] = cache
+			}
+		}
+	}
+
+	rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Conversation_id", cache.ID)
+	httpReq.Header.Set("Session_id", cache.ID)
+	return httpReq, nil
+}
+
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
@@ -314,6 +532,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "0.21.0")
 	misc.EnsureHeader(r.Header, ginHeaders, "Openai-Beta", "responses=experimental")
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
+	misc.EnsureHeader(r.Header, ginHeaders, "User-Agent", "codex_cli_rs/0.50.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464")
 
 	r.Header.Set("Accept", "text/event-stream")
 	r.Header.Set("Connection", "Keep-Alive")

@@ -4,6 +4,9 @@
 package util
 
 import (
+	"net/url"
+	"strings"
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 )
@@ -140,4 +143,102 @@ func HideAPIKey(apiKey string) string {
 		return apiKey[:1] + "..." + apiKey[len(apiKey)-1:]
 	}
 	return apiKey
+}
+
+// maskAuthorizationHeader masks the Authorization header value while preserving the auth type prefix.
+// Common formats: "Bearer <token>", "Basic <credentials>", "ApiKey <key>", etc.
+// It preserves the prefix (e.g., "Bearer ") and only masks the token/credential part.
+//
+// Parameters:
+//   - value: The Authorization header value
+//
+// Returns:
+//   - string: The masked Authorization value with prefix preserved
+func MaskAuthorizationHeader(value string) string {
+	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
+	if len(parts) < 2 {
+		return HideAPIKey(value)
+	}
+	return parts[0] + " " + HideAPIKey(parts[1])
+}
+
+// MaskSensitiveHeaderValue masks sensitive header values while preserving expected formats.
+//
+// Behavior by header key (case-insensitive):
+//   - "Authorization": Preserve the auth type prefix (e.g., "Bearer ") and mask only the credential part.
+//   - Headers containing "api-key": Mask the entire value using HideAPIKey.
+//   - Others: Return the original value unchanged.
+//
+// Parameters:
+//   - key:   The HTTP header name to inspect (case-insensitive matching).
+//   - value: The header value to mask when sensitive.
+//
+// Returns:
+//   - string: The masked value according to the header type; unchanged if not sensitive.
+func MaskSensitiveHeaderValue(key, value string) string {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	switch {
+	case strings.Contains(lowerKey, "authorization"):
+		return MaskAuthorizationHeader(value)
+	case strings.Contains(lowerKey, "api-key"),
+		strings.Contains(lowerKey, "apikey"),
+		strings.Contains(lowerKey, "token"),
+		strings.Contains(lowerKey, "secret"):
+		return HideAPIKey(value)
+	default:
+		return value
+	}
+}
+
+// MaskSensitiveQuery masks sensitive query parameters, e.g. auth_token, within the raw query string.
+func MaskSensitiveQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	changed := false
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		keyPart := part
+		valuePart := ""
+		if idx := strings.Index(part, "="); idx >= 0 {
+			keyPart = part[:idx]
+			valuePart = part[idx+1:]
+		}
+		decodedKey, err := url.QueryUnescape(keyPart)
+		if err != nil {
+			decodedKey = keyPart
+		}
+		if !shouldMaskQueryParam(decodedKey) {
+			continue
+		}
+		decodedValue, err := url.QueryUnescape(valuePart)
+		if err != nil {
+			decodedValue = valuePart
+		}
+		masked := HideAPIKey(strings.TrimSpace(decodedValue))
+		parts[i] = keyPart + "=" + url.QueryEscape(masked)
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	return strings.Join(parts, "&")
+}
+
+func shouldMaskQueryParam(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return false
+	}
+	key = strings.TrimSuffix(key, "[]")
+	if key == "key" || strings.Contains(key, "api-key") || strings.Contains(key, "apikey") || strings.Contains(key, "api_key") {
+		return true
+	}
+	if strings.Contains(key, "token") || strings.Contains(key, "secret") {
+		return true
+	}
+	return false
 }
