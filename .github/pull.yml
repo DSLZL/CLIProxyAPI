@@ -1,0 +1,9 @@
+version: "1"
+rules:
+  - base: master
+    upstream: wei:master
+    # 关键修改：将 hardreset 改为 merge
+    # merge: 保留你的提交历史和文件，尝试合并上游变更
+    # 注意：如果上游也修改了 .github 下的文件，可能会产生冲突，导致合并失败，需要人工处理 PR
+    mergeMethod: merge 
+    mergeUnstable: false
